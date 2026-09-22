@@ -1,0 +1,1251 @@
+---
+title: "AOL Time Series"
+author: "Asyifa Izzatil Isma"
+date: "2026-06-15"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# FORECASTING HARGA CABAI RAWIT MERAH
+Struktur:
+
+1. Data Preprocessing
+2. Exploratory Data Analysis (EDA)
+3. Analisis Karakteristik Time Series
+4. Helper Functions
+5. Train-Test Split
+6. Family A : Naive
+7. Family B : Exponential Smoothing
+8.1 Family C : ARIMA
+8.2 Family C: SARIMA
+9. Family D : Time Series Regression
+10. Family E : Neural Network (NNAR)
+11. Tabel Utama (Best Model per Family)
+
+## 1. Data Preprocessing
+### 1.1 Load Libraries
+```{r}
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(Metrics)
+library(nortest)
+library(lmtest)
+library(car)
+library(pracma)
+library(tidyverse)
+```
+
+### 1.2 Import Dataset
+```{r}
+cabai <- read_excel("Tabel Harga Berdasarkan Daerah (5).xlsx")
+
+str(cabai)
+head(cabai)
+```
+
+### 1.3 Seleksi Komoditas
+```{r}
+cabai <- cabai[, -1]
+
+cabai_filtered <- cabai %>%
+  filter(`Komoditas (Rp)` %in% "Cabai Rawit Merah")
+```
+
+### 1.4 Restrukturisasi Data
+```{r}
+cabai_transpose <- as.data.frame(t(cabai_filtered[-1]))
+colnames(cabai_transpose) <- cabai_filtered$`Komoditas (Rp)`
+cabai_transpose$Date <- rownames(cabai_transpose)
+cabai_transpose <- cabai_transpose %>% select(Date, everything())
+rownames(cabai_transpose) <- NULL
+```
+
+### 1.5 Rename Variabel
+```{r}
+cabai_transpose <- cabai_transpose %>%
+  rename(Cabai_Rawit_Merah = `Cabai Rawit Merah`)
+```
+
+### 1.6 Konversi Tipe Data
+```{r}
+cabai_transpose[cabai_transpose == "-"] <- NA
+cabai_transpose$Date <- dmy(cabai_transpose$Date)
+cabai_transpose$Cabai_Rawit_Merah <- as.numeric(
+  gsub(",", "", cabai_transpose$Cabai_Rawit_Merah)
+)
+```
+
+### 1.7 Penanganan Missing Value
+```{r}
+colSums(is.na(cabai_transpose))
+
+cabai_transpose$Cabai_Rawit_Merah <- na.approx(
+  cabai_transpose$Cabai_Rawit_Merah
+)
+
+colSums(is.na(cabai_transpose))
+```
+
+### 1.8 Validasi Dataset Final
+```{r}
+str(cabai_transpose)
+summary(cabai_transpose)
+```
+
+### 1.9 Kontruksi Time Series
+```{r}
+ts_cabai_merah <- ts(
+  cabai_transpose$Cabai_Rawit_Merah,
+  frequency = 5
+)
+```
+
+
+## 2. Exploratory Data Analysis (EDA)
+### 2.1 Time Series Plot
+```{r}
+ggplot(cabai_transpose, aes(x = Date, y = Cabai_Rawit_Merah)) +
+  geom_line(color = "red") +
+  labs(
+    title = "Tren Harga Cabai Rawit Merah (2021–2026)",
+    x = "Tanggal",
+    y = "Harga (Rp)"
+  ) +
+  theme_minimal()
+```
+
+
+### 2.2 Distribusi Harga
+```{r}
+ggplot(cabai_transpose, aes(x = Cabai_Rawit_Merah)) +
+  geom_histogram(bins = 30, fill = "#800009", color = "black") +
+  labs(
+    title = "Distribusi Harga Cabai Rawit Merah",
+    x = "Harga (Rp)",
+    y = "Frekuensi"
+  ) +
+  theme_minimal()
+```
+
+### 2.3 Boxplot (Deteksi Outlier)
+```{r}
+ggplot(cabai_transpose, aes(y = Cabai_Rawit_Merah)) +
+  geom_boxplot(fill = "#800009") +
+  labs(
+    title = "Boxplot Cabai Rawit Merah",
+    y = "Harga (Rp)"
+  ) +
+  theme_minimal()
+```
+
+
+
+## 3. Analisis Karakteristik
+### 3.1 Plot Time Series
+```{r}
+autoplot(ts_cabai_merah)
+```
+
+
+### 3.2 Dekomposisi
+```{r}
+decomp_merah <- stl(ts_cabai_merah, s.window = "periodic")
+plot(decomp_merah)
+
+plot(decompose(ts_cabai_merah, type = "multiplicative"))
+decompose(ts_cabai_merah, type = "additive")$seasonal
+```
+
+### 3.3 Uji Stationeritas Varians
+```{r}
+summary(powerTransform(ts_cabai_merah))
+```
+
+### 3.4 Transformasi Box-Cox
+```{r}
+lambda <- -0.3426
+
+ts_merah_trans <- BoxCox(ts_cabai_merah, lambda)
+
+summary(powerTransform(ts_merah_trans))
+```
+
+
+### 3.5 Uji Stationeritas Awal
+```{r}
+adf.test(ts_cabai_merah)
+
+acf(ts_merah_trans,
+    main = "ACF – Transformasi Cabai Rawit Merah",
+    lag.max = 1000)
+
+pacf(ts_merah_trans,
+     main = "PACF – Transformasi Cabai Rawit Merah",
+     lag.max = 1000)
+```
+
+
+## 4. Helper Function
+### 4.1 Evaluasi Forecast (RMSE, MAE, MAPE)
+Argumen:
+
+- actual: vektor nilai aktual
+- predicted: vektor nilai prediksi
+- nama model (karakter)
+
+Return: data.frame satu baris (Model, RMSE, MAE, MAPE)
+
+```{r}
+eval_forecast <- function(actual, predicted, model_name) {
+  data.frame(
+    Model = model_name,
+    RMSE  = Metrics::rmse(actual, predicted),
+    MAE   = Metrics::mae(actual, predicted),
+    MAPE  = mean(abs((actual - predicted) / actual)) * 100,
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+
+### 4.2 Ambil Best Model dari Family Table
+Argumen:
+
+- family_result : data.frame hasil eval per family
+- metric        : kolom acuan ("MAPE", "RMSE", atau "MAE")
+
+Return: satu barus data.frame model terbaik
+
+```{r}
+get_best_model <- function(family_results, metric = "MAPE") {
+  family_results[which.min(family_results[[metric]]), ]
+}
+```
+
+
+### 4.2 Print Family Table
+```{r}
+print_family_table <- function(family_results, family_name) {
+  cat("\n", strrep("=", 55), "\n", sep = "")
+  cat(" FAMILY:", toupper(family_name), "\n")
+  cat(strrep("=", 55), "\n")
+  print(family_results, row.names = FALSE, digits = 4)
+  cat(strrep("-", 55), "\n")
+  best <- get_best_model(family_results)
+  cat(" Best Model:", best$Model,
+      "| MAPE:", round(best$MAPE, 4), "%\n")
+  cat(strrep("=", 55), "\n\n")
+}
+```
+
+
+
+## 5. Train-Test Split
+```{r}
+n          <- length(ts_cabai_merah)
+train_size <- floor(0.8 * n)
+
+train_merah <- window(ts_cabai_merah,
+                      end = time(ts_cabai_merah)[train_size])
+test_merah  <- window(ts_cabai_merah,
+                      start = time(ts_cabai_merah)[train_size + 1])
+
+# Split untuk data transformasi
+n_trans          <- length(ts_merah_trans)
+train_size_trans <- floor(0.8 * n_trans)
+
+train_merah_trans <- window(ts_merah_trans,
+                            end = time(ts_merah_trans)[train_size_trans])
+test_merah_trans  <- window(ts_merah_trans,
+                            start = time(ts_merah_trans)[train_size_trans + 1])
+
+cat("Total observasi  :", n, "\n")
+cat("Training         :", length(train_merah), "\n")
+cat("Testing          :", length(test_merah), "\n")
+```
+
+```{r}
+# Plot Pembagian Data
+split_time <- time(ts_cabai_merah)[train_size]
+
+plot_data <- data.frame(
+  Time    = time(ts_cabai_merah),
+  Harga   = as.numeric(ts_cabai_merah),
+  Dataset = c(rep("Training", train_size),
+              rep("Testing", n - train_size))
+)
+
+ggplot(plot_data, aes(x = Time, y = Harga, color = Dataset)) +
+  annotate("rect",
+           xmin = min(plot_data$Time), xmax = split_time,
+           ymin = -Inf, ymax = Inf,
+           fill = "lightpink", alpha = 0.15) +
+  annotate("rect",
+           xmin = split_time, xmax = max(plot_data$Time),
+           ymin = -Inf, ymax = Inf,
+           fill = "#FFF9D2", alpha = 0.15) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = split_time, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Training" = "#800009", "Testing" = "#ffda3a")) +
+  labs(
+    title = "Pembagian Data Training dan Testing",
+    x = "Time", y = "Harga Cabai Rawit Merah", color = "Dataset"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = "bottom")
+```
+
+
+## 6. Family A: NAIVE
+### 6.1 Naive
+```{r}
+model_naive    <- naive(train_merah, h = length(test_merah))
+forecast_naive <- forecast(model_naive, h = length(test_merah))
+
+results_naive_family <- eval_forecast(test_merah, forecast_naive$mean, "Naive")
+```
+
+### 6.2 Seasonal Naive
+```{r}
+model_snaive    <- snaive(train_merah, h = length(test_merah))
+forecast_snaive <- forecast(model_snaive, h = length(test_merah))
+
+results_naive_family <- rbind(
+  results_naive_family,
+  eval_forecast(test_merah, forecast_snaive$mean, "Seasonal Naive")
+)
+
+print_family_table(results_naive_family, "Naive Family")
+best_naive <- get_best_model(results_naive_family)
+```
+
+
+## 7. Family B: Exponential Smoothing
+```{r}
+results_es_family <- data.frame()
+
+# Holt-Winters
+model_hw <- HoltWinters(train_merah, seasonal = "additive")
+
+fc_hw <- forecast(
+  model_hw,
+  h = length(test_merah)
+)
+
+hw_result <- eval_forecast(
+  test_merah,
+  fc_hw$mean,
+  "Holt-Winters"
+)
+
+hw_result$ETS_Type <- "Holt-Winters"
+hw_result$Parameters <- "-"
+
+results_es_family <- rbind(
+  results_es_family,
+  hw_result
+)
+
+# Helper ETS
+run_ets <- function(alpha, beta, gamma, label){
+  
+  fit <- tryCatch(
+    ets(
+      train_merah,
+      #model = "ZZZ",
+      model = "MAA",
+      alpha = alpha,
+      beta  = beta,
+      gamma = gamma,
+      damped = TRUE
+    ),
+    error = function(e) NULL
+  )
+  
+  if(is.null(fit)){
+    return(NULL)
+  }
+  
+  fc <- forecast(
+    fit,
+    h = length(test_merah)
+  )
+  
+  result <- eval_forecast(
+    test_merah,
+    fc$mean,
+    label
+  )
+  
+  result$ETS_Type <- fit$method
+  
+  result$Parameters <- paste0(
+    "(",
+    alpha, ", ",
+    beta, ", ",
+    gamma, ")"
+  )
+  
+  result
+}
+
+# ETS-1 s.d ETS-9
+ets_results <- do.call(
+  rbind,
+  Filter(
+    Negate(is.null),
+    list(
+      
+      # Baseline
+      run_ets(0.2,0.1,0.1,"ETS(0.2,0.1,0.1)"),
+      run_ets(0.4,0.1,0.1,"ETS(0.4,0.1,0.1)"),
+      run_ets(0.6,0.1,0.1,"ETS(0.6,0.1,0.1)"),
+      
+      # Trend mulai diperbesar
+      run_ets(0.6,0.3,0.1,"ETS(0.6,0.3,0.1)"),
+      run_ets(0.6,0.5,0.1,"ETS(0.6,0.5,0.1)"),
+      
+      # Seasonal mulai diperbesar
+      run_ets(0.6,0.5,0.2,"ETS(0.6,0.5,0.2)"),
+      run_ets(0.6,0.5,0.3,"ETS(0.6,0.5,0.3)"),
+      
+      # High trend + high seasonal
+      run_ets(0.5,0.5,0.4,"ETS(0.5,0.5,0.4)"),
+      run_ets(0.5,0.5,0.5,"ETS(0.5,0.5,0.5)")
+    )
+  )
+)
+
+results_es_family <- rbind(
+  results_es_family,
+  ets_results
+)
+
+results_es_family <- results_es_family[
+  ,
+  c(
+    "Model",
+    "ETS_Type",
+    "Parameters",
+    "RMSE",
+    "MAE",
+    "MAPE"
+  )
+]
+
+# ETS Auto
+ets_auto <- ets(train_merah)
+
+summary(ets_auto)
+
+fc_auto <- forecast(
+  ets_auto,
+  h = length(test_merah)
+)
+
+auto_result <- eval_forecast(
+  test_merah,
+  fc_auto$mean,
+  "ETS Auto"
+)
+
+auto_result$ETS_Type <- ets_auto$method
+
+auto_result$Parameters <- "Auto"
+
+results_es_family <- rbind(
+  results_es_family,
+  auto_result
+)
+
+print_family_table(
+  results_es_family,
+  "Exponential Smoothing Family"
+)
+
+best_es <- get_best_model(results_es_family)
+```
+
+
+## 8.1 Family C: ARIMA
+Semua model dilatih pada data TRANSFORMASI (ts_merah_trans)
+Hasil prediksi di-invers dengan InvBoxCox sebelum evaluasi.
+```{r}
+fit_arima <- function(order, train, test_actual, lambda) {
+  model    <- Arima(train, order = order)
+  fc       <- forecast(model, h = length(test_actual))
+  pred     <- InvBoxCox(fc$mean, lambda)
+  label    <- paste0("ARIMA(", paste(order, collapse = ","), ")")
+  list(
+    model   = model,
+    results = eval_forecast(test_actual, pred, label)
+  )
+}
+
+arima_orders <- list(
+  c(1,0,0),
+  c(2,0,0),
+  c(0,0,1),
+  c(0,0,2),
+  c(1,0,1),
+  c(2,0,1),
+  c(0,1,1),
+  c(1,1,0),
+  c(1,1,1)
+)
+
+arima_fits    <- lapply(arima_orders, fit_arima,
+                        train        = train_merah_trans,
+                        test_actual  = test_merah,
+                        lambda       = lambda)
+
+results_arima_family <- do.call(rbind, lapply(arima_fits, `[[`, "results"))
+
+# Simpan semua objek model ARIMA untuk keperluan diagnostik
+arima_model_list <- setNames(
+  lapply(arima_fits, `[[`, "model"),
+  results_arima_family$Model
+)
+
+# Diagnostik residual untuk semua model ARIMA
+for (nm in names(arima_model_list)) {
+  cat("\n--- Diagnostik:", nm, "---\n")
+  print(coeftest(arima_model_list[[nm]]))
+  print(lillie.test(residuals(arima_model_list[[nm]])))
+}
+
+aic_table <- data.frame(
+  Model = names(arima_model_list),
+  AIC   = sapply(arima_model_list, AIC)
+)
+
+aic_table <- aic_table[order(aic_table$AIC), ]
+
+print(aic_table, row.names = FALSE)
+
+print_family_table(results_arima_family, "ARIMA Family")
+best_arima <- get_best_model(results_arima_family)
+```
+
+
+## FAMILY C : SARIMA
+Semua model dilatih pada data TRANSFORMASI (ts_merah_trans)
+Hasil prediksi di-invers dengan InvBoxCox sebelum evaluasi.
+```{r}
+fit_sarima <- function(order,
+                       seasonal_order,
+                       train,
+                       test_actual,
+                       lambda,
+                       period = 5) {
+  
+  model <- Arima(
+    train,
+    order = order,
+    seasonal = list(
+      order = seasonal_order,
+      period = period
+    )
+  )
+  
+  fc <- forecast(
+    model,
+    h = length(test_actual)
+  )
+  
+  pred <- InvBoxCox(
+    fc$mean,
+    lambda
+  )
+  
+  label <- paste0(
+    "SARIMA(",
+    paste(order, collapse = ","),
+    ")(",
+    paste(seasonal_order, collapse = ","),
+    ")[",
+    period,
+    "]"
+  )
+  
+  list(
+    model = model,
+    results = eval_forecast(
+      test_actual,
+      pred,
+      label
+    )
+  )
+}
+
+sarima_configs <- list(
+  
+  list(
+    order = c(1,0,0),
+    seasonal = c(1,0,0)
+  ),
+  
+  list(
+    order = c(2,0,0),
+    seasonal = c(1,0,0)
+  ),
+  
+  list(
+    order = c(0,0,1),
+    seasonal = c(0,0,1)
+  ),
+  
+  list(
+    order = c(0,0,2),
+    seasonal = c(0,0,1)
+  ),
+  
+  list(
+    order = c(1,0,1),
+    seasonal = c(1,0,1)
+  ),
+  
+  list(
+    order = c(2,0,1),
+    seasonal = c(1,0,1)
+  ),
+  
+  list(
+    order = c(0,1,1),
+    seasonal = c(0,0,1)
+  ),
+  
+  list(
+    order = c(1,1,0),
+    seasonal = c(1,0,0)
+  ),
+  
+  list(
+    order = c(1,1,1),
+    seasonal = c(0,0,1)
+  )
+  
+)
+
+sarima_fits <- lapply(
+  sarima_configs,
+  function(x) {
+    
+    fit_sarima(
+      order = x$order,
+      seasonal_order = x$seasonal,
+      train = train_merah_trans,
+      test_actual = test_merah,
+      lambda = lambda
+    )
+    
+  }
+)
+
+results_sarima_family <- do.call(
+  rbind,
+  lapply(
+    sarima_fits,
+    `[[`,
+    "results"
+  )
+)
+
+print_family_table(
+  results_sarima_family,
+  "SARIMA Family"
+)
+
+best_sarima <- get_best_model(
+  results_sarima_family
+)
+
+sarima_model_list <- setNames(
+  lapply(
+    sarima_fits,
+    `[[`,
+    "model"
+  ),
+  results_sarima_family$Model
+)
+
+for(nm in names(sarima_model_list)){
+  
+  cat(
+    "\n--- Diagnostik:",
+    nm,
+    "---\n"
+  )
+  
+  print(
+    coeftest(
+      sarima_model_list[[nm]]
+    )
+  )
+  
+}
+
+aic_table <- data.frame(
+  Model = names(sarima_model_list),
+  AIC   = sapply(sarima_model_list, AIC)
+)
+
+aic_table <- aic_table[order(aic_table$AIC), ]
+
+print(aic_table, row.names = FALSE)
+```
+
+## 9. Family D: Time Series Regression
+### 9.1 Buat Lag Variables
+```{r}
+reg_data <- data.frame(y = as.numeric(ts_cabai_merah)) %>%
+  mutate(
+    lag1 = dplyr::lag(y, 1),
+    lag2 = dplyr::lag(y, 2),
+    lag3 = dplyr::lag(y, 3)
+  ) %>%
+  na.omit()
+```
+
+### 9.2 Train-Test Split Regression
+```{r}
+n_reg          <- nrow(reg_data)
+train_size_reg <- floor(0.8 * n_reg)
+
+train_reg <- reg_data[1:train_size_reg, ]
+test_reg  <- reg_data[(train_size_reg + 1):n_reg, ]
+h_reg     <- nrow(test_reg)
+```
+
+### 9.3 Template Recursive Forecasting
+Argumen:
+
+- model    : objek lm
+- train    : data.frame training
+- h        : horizon
+- lag_vars : karakter nama lag yang digunakan, e.g. c("lag1","lag3")
+
+```{r}
+recursive_forecast_lm <- function(model, train, h, lag_vars) {
+  
+  max_lag <- max(as.integer(gsub("lag", "", lag_vars)))
+  
+  # Siapkan buffer lag dari akhir training
+  lag_buffer <- rev(tail(train$y, max_lag))   # lag_buffer[1] = lag1, dll.
+  names(lag_buffer) <- paste0("lag", seq_along(lag_buffer))
+  
+  pred <- numeric(h)
+  
+  for (i in 1:h) {
+    new_data  <- as.data.frame(as.list(lag_buffer[lag_vars]))
+    pred[i]   <- predict(model, newdata = new_data)
+    
+    # Geser buffer: tambah prediksi baru di posisi lag1
+    lag_buffer <- c(pred[i], lag_buffer[-max_lag])
+    names(lag_buffer) <- paste0("lag", seq_along(lag_buffer))
+  }
+  
+  pred
+}
+```
+
+### 9.4 Fit & Evaluasi Semua Model Regresi
+```{r}
+reg_specs <- list(
+  list(formula = y ~ lag1 + lag2 + lag3, lags = c("lag1", "lag2", "lag3"),
+       label = "Regression(lag1+lag2+lag3)"),
+  list(formula = y ~ lag1 + lag3,        lags = c("lag1", "lag3"),
+       label = "Regression(lag1+lag3)"),
+  list(formula = y ~ lag1,               lags = c("lag1"),
+       label = "Regression(lag1)"),
+  list(formula = y ~ lag3,               lags = c("lag3"),
+       label = "Regression(lag3)")
+)
+
+results_reg_family <- data.frame()
+
+for (spec in reg_specs) {
+  mdl  <- lm(spec$formula, data = train_reg)
+  pred <- recursive_forecast_lm(mdl, train_reg, h_reg, spec$lags)
+  results_reg_family <- rbind(
+    results_reg_family,
+    eval_forecast(test_reg$y, pred, spec$label)
+  )
+  cat("\n--- Summary:", spec$label, "---\n")
+  print(summary(mdl))
+}
+
+print_family_table(results_reg_family, "Time Series Regression Family")
+best_reg <- get_best_model(results_reg_family)
+```
+
+
+## 10. Family E: Neural Network (NNAR)
+```{r}
+set.seed(123)
+
+run_nnar <- function(p, P, size, label){
+  
+  set.seed(123)
+  
+  fit <- tryCatch(
+    nnetar(
+      train_merah,
+      p = p,
+      P = P,
+      size = size
+    ),
+    error = function(e) NULL
+  )
+  
+  if(is.null(fit)){
+    return(NULL)
+  }
+  
+  fc <- forecast(
+    fit,
+    h = length(test_merah)
+  )
+  
+  eval_forecast(
+    test_merah,
+    fc$mean,
+    label
+  )
+}
+
+results_nnar_family <- do.call(
+  rbind,
+  Filter(
+    Negate(is.null),
+    list(
+      run_nnar(1,0, 2, "NNAR(1,0,2)"),
+      run_nnar(2,0, 2, "NNAR(2,0,2)"),
+      run_nnar(3,0, 2, "NNAR(3,0,2)"),
+      run_nnar(2,0, 3, "NNAR(2,0,3)"),
+      run_nnar(5,0, 3, "NNAR(5,0,3)"),
+      run_nnar(7,0, 4, "NNAR(7,0,4)"),
+      run_nnar(10,0, 5, "NNAR(10,0,5)"),
+      run_nnar(1,1, 2, "NNAR(1,1,2)"),
+      run_nnar(3,1, 2, "NNAR(3,1,2)"),
+      run_nnar(5,1, 3, "NNAR(5,1,3)"),
+      run_nnar(7,1, 4, "NNAR(7,1,4)"),
+      run_nnar(10,1, 5, "NNAR(10,1,5)")
+    )
+  )
+)
+
+# NNAR Auto
+set.seed(123)
+fit_nnar_auto <- nnetar(train_merah)
+
+fc_nnar_auto <- forecast(
+  fit_nnar_auto,
+  h = length(test_merah)
+)
+
+results_nnar_family <- rbind(
+  results_nnar_family,
+  eval_forecast(
+    test_merah,
+    fc_nnar_auto$mean,
+    "NNAR Auto"
+  )
+)
+
+print_family_table(
+  results_nnar_family,
+  "NNAR Family"
+)
+
+best_nnar <- get_best_model(results_nnar_family)
+```
+
+
+## 11. Table Utama - Best Model per Family
+```{r}
+main_results <- rbind(
+  best_naive %>% select(Model, RMSE, MAE, MAPE) %>% mutate(Family = "Naive", .before = 1),
+  best_es %>% select(Model, RMSE, MAE, MAPE) %>% mutate(Family = "Exponential Smoothing", .before = 1),
+  best_arima %>% select(Model, RMSE, MAE, MAPE) %>% mutate(Family = "ARIMA", .before = 1),
+  best_sarima %>% select(Model, RMSE, MAE, MAPE) %>% mutate(Family = "SARIMA", .before = 1),
+  best_reg %>% select(Model, RMSE, MAE, MAPE) %>% mutate(Family = "Regression", .before = 1),
+  best_nnar %>% select(Model, RMSE, MAE, MAPE) %>% mutate(Family = "Neural Network", .before = 1)
+)
+
+print_bestModel_table <- function(main_results){
+  cat("\n", strrep("=", 65), "\n", sep = "")
+  cat("  TABEL UTAMA: BEST MODEL PER FAMILY\n")
+  cat(strrep("=", 65), "\n")
+  print(main_results, row.names = FALSE, digits = 4)
+  cat(strrep("=", 65), "\n")
+  best <- get_best_model(main_results)
+  cat("  OVERALL BEST MODEL:",
+      get_best_model(main_results)$Model,
+      "| MAPE:", round(best$MAPE, 4),"%\n")
+  cat(strrep("=", 65), "\n")
+}
+
+print_bestModel_table(main_results)
+```
+
+
+## 12. Forecast VS Actual Plots
+Helper: buat data.frame plot dari vektor aktual + prediksi
+
+```{r}
+# Buat data.frame long untuk ggplot
+make_plot_df <- function(actual_vec, predicted_vec, model_label) {
+  data.frame(
+    Index     = seq_along(actual_vec),
+    Actual    = as.numeric(actual_vec),
+    Predicted = as.numeric(predicted_vec),
+    Model     = model_label
+  )
+}
+
+# Template plot Forecast vs Actual (sesuai gambar referensi)
+plot_forecast_vs_actual <- function(plot_df,
+                                    title    = "Forecast vs Actual",
+                                    subtitle = NULL) {
+  ggplot(plot_df, aes(x = Index)) +
+    geom_line(aes(y = Actual,    color = "Actual"),
+              linewidth = 0.65) +
+    geom_line(aes(y = Predicted, color = "Forecast"),
+              linewidth = 0.75) +
+    scale_color_manual(
+      name   = "colour",
+      values = c("Actual"   = "#1a1a1a",
+                 "Forecast" = "#2196F3")
+    ) +
+    labs(
+      title    = title,
+      subtitle = subtitle,
+      x        = "Week Index",
+      y        = "Harga (Rp)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 13),
+      plot.subtitle    = element_text(size = 10, color = "grey40"),
+      legend.position  = "right",
+      legend.title     = element_text(size = 10),
+      panel.grid.minor = element_blank()
+    )
+}
+
+# Shortcut ambil MAPE dari family results berdasarkan nama model
+get_mape_label <- function(results_df, model_nm) {
+  row <- results_df[results_df$Model == model_nm, "MAPE"]
+  if (length(row) == 0 || is.na(row)) return("N/A")
+  paste0("MAPE: ", round(row, 2), "%")
+}
+```
+
+
+### 12.1 FAMILY A : NAIVE
+```{r}
+# Naive
+print(
+  plot_forecast_vs_actual(
+    make_plot_df(test_merah, forecast_naive$mean, "Naive"),
+    title    = "Naive – Forecast vs Actual",
+    subtitle = get_mape_label(results_naive_family, "Naive")
+  )
+)
+
+# Seasonal Naive
+print(
+  plot_forecast_vs_actual(
+    make_plot_df(test_merah, forecast_snaive$mean, "Seasonal Naive"),
+    title    = "Seasonal Naive – Forecast vs Actual",
+    subtitle = get_mape_label(results_naive_family, "Seasonal Naive")
+  )
+)
+```
+
+### 12.2 FAMILY B : EXPONENTIAL SMOOTHING
+run_ets() hanya menyimpan hasil eval, bukan objek model. Jadi untuk plot, re-fit menggunakan parameter yang sama.
+
+```{r}
+# ETS manual: definisi parameter sama persis dengan run_ets() di section 7
+ets_plot_specs <- list(
+  list(alpha = 0.2, beta = 0.1, gamma = 0.1, label = "ETS(0.2,0.1,0.1)"),
+  list(alpha = 0.4, beta = 0.1, gamma = 0.1, label = "ETS(0.4,0.1,0.1)"),
+  list(alpha = 0.6, beta = 0.1, gamma = 0.1, label = "ETS(0.6,0.1,0.1)"),
+  list(alpha = 0.6, beta = 0.3, gamma = 0.1, label = "ETS(0.6,0.3,0.1)"),
+  list(alpha = 0.6, beta = 0.5, gamma = 0.1, label = "ETS(0.6,0.5,0.1)"),
+  list(alpha = 0.6, beta = 0.5, gamma = 0.2, label = "ETS(0.6,0.5,0.2)"),
+  list(alpha = 0.6, beta = 0.5, gamma = 0.3, label = "ETS(0.6,0.5,0.3)"),
+  list(alpha = 0.5, beta = 0.5, gamma = 0.4, label = "ETS(0.5,0.5,0.4)"),
+  list(alpha = 0.5, beta = 0.5, gamma = 0.5, label = "ETS(0.5,0.5,0.5)")
+)
+
+for (spec in ets_plot_specs) {
+  fit_tmp <- tryCatch(
+    ets(train_merah, model = "MAA",
+        alpha = spec$alpha, beta = spec$beta, gamma = spec$gamma,
+        damped = TRUE),
+    error = function(e) NULL
+  )
+  if (is.null(fit_tmp)) next
+  
+  fc_tmp <- forecast(fit_tmp, h = length(test_merah))
+  
+  print(
+    plot_forecast_vs_actual(
+      make_plot_df(test_merah, fc_tmp$mean, spec$label),
+      title    = paste(spec$label, "– Forecast vs Actual"),
+      subtitle = get_mape_label(results_es_family, spec$label)
+    )
+  )
+}
+```
+
+
+### 12.3 FAMILY C : ARIMA
+arima_fits[[i]]$model sudah tersimpan → langsung forecast ulang. Pakai index [[i]] bukan [[nama]] untuk hindari masalah karakter "()".
+
+```{r}
+i       <- which(sapply(arima_orders, function(o) all(o == c(1,0,0))))
+nm      <- results_arima_family$Model[i]
+pred_tmp <- InvBoxCox(
+  forecast(arima_fits[[i]]$model, h = length(test_merah))$mean,
+  lambda
+)
+
+print(
+  plot_forecast_vs_actual(
+    make_plot_df(test_merah, pred_tmp, nm),
+    title    = paste(nm, "– Forecast vs Actual"),
+    subtitle = get_mape_label(results_arima_family, nm)
+  )
+)
+```
+
+
+### 12.4 FAMILY C : SARIMA
+```{r}
+i <- which(sapply(sarima_configs, function(s) {
+  all(s$order == c(1,0,0)) & all(s$seasonal == c(1,0,0))
+}))
+
+nm       <- results_sarima_family$Model[i]
+pred_tmp <- InvBoxCox(
+  forecast(sarima_fits[[i]]$model, h = length(test_merah))$mean,
+  lambda
+)
+
+print(
+  plot_forecast_vs_actual(
+    make_plot_df(test_merah, pred_tmp, nm),
+    title    = paste(nm, "– Forecast vs Actual"),
+    subtitle = get_mape_label(results_sarima_family, nm)
+  )
+)
+```
+
+
+### 12.5 FAMILY D : TIME SERIES REGRESSION
+Re-fit lm() dari reg_specs, lalu recursive forecast.
+```{r}
+spec     <- reg_specs[[which(sapply(reg_specs, `[[`, "label") == "Regression(lag1)")]]
+mdl_tmp  <- lm(spec$formula, data = train_reg)
+pred_tmp <- recursive_forecast_lm(mdl_tmp, train_reg, h_reg, spec$lags)
+
+print(
+  plot_forecast_vs_actual(
+    make_plot_df(test_reg$y, pred_tmp, spec$label),
+    title    = paste(spec$label, "– Forecast vs Actual"),
+    subtitle = get_mape_label(results_reg_family, spec$label)
+  )
+)
+```
+
+
+### 12.6 FAMILY E : NNAR
+run_nnar() tidak simpan objek model → re-fit di sini. Spesifikasi sama persis dengan section 10.
+```{r}
+nnar_plot_specs <- list(
+  list(p = 2,  P = 0, size = 2, label = "NNAR(2,0,2)")
+)
+
+for (spec in nnar_plot_specs) {
+  set.seed(123)
+  fit_tmp <- tryCatch(
+    nnetar(train_merah, p = spec$p, P = spec$P, size = spec$size),
+    error = function(e) NULL
+  )
+  if (is.null(fit_tmp)) next
+  
+  fc_tmp <- forecast(fit_tmp, h = length(test_merah))
+  
+  print(
+    plot_forecast_vs_actual(
+      make_plot_df(test_merah, fc_tmp$mean, spec$label),
+      title    = paste(spec$label, "– Forecast vs Actual"),
+      subtitle = get_mape_label(results_nnar_family, spec$label)
+    )
+  )
+}
+```
+
+
+### 12.7 PLOT GABUNGAN: BEST MODEL PER FAMILY
+
+Ambil prediksi best model per family
+
+#### A. Naive
+```{r}
+best_naive_pred <- if (best_naive$Model == "Naive") {
+  forecast_naive$mean
+} else {
+  forecast_snaive$mean
+}
+```
+
+#### B. ETS
+```{r}
+if (best_es$Model == "Holt-Winters") {
+  best_es_pred <- fc_hw$mean
+  
+} else if (best_es$Model == "ETS Auto") {
+  best_es_pred <- fc_auto$mean
+  
+} else {
+  # Parse alpha, beta, gamma dari label "ETS(a,b,c)"
+  params_num  <- as.numeric(
+    strsplit(gsub("ETS\\(|\\)", "", best_es$Model), ",")[[1]]
+  )
+  fit_best_es  <- ets(train_merah, model = "MAA",
+                      alpha  = params_num[1],
+                      beta   = params_num[2],
+                      gamma  = params_num[3],
+                      damped = TRUE)
+  best_es_pred <- forecast(fit_best_es, h = length(test_merah))$mean
+}
+```
+
+#### C. ARIMA — cari index dari results_arima_family, bukan dari nama list
+```{r}
+best_arima_i    <- which(results_arima_family$Model == best_arima$Model)
+best_arima_pred <- InvBoxCox(
+  forecast(arima_fits[[best_arima_i]]$model, h = length(test_merah))$mean,
+  lambda
+)
+```
+
+#### D. SARIMA
+```{r}
+best_sarima_i    <- which(results_sarima_family$Model == best_sarima$Model)
+best_sarima_pred <- InvBoxCox(
+  forecast(sarima_fits[[best_sarima_i]]$model, h = length(test_merah))$mean,
+  lambda
+)
+```
+
+
+#### E. Regression
+```{r}
+best_reg_spec  <- reg_specs[[which(sapply(reg_specs, `[[`, "label") == best_reg$Model)]]
+mdl_best_reg   <- lm(best_reg_spec$formula, data = train_reg)
+best_reg_pred  <- recursive_forecast_lm(mdl_best_reg, train_reg, h_reg, best_reg_spec$lags)
+```
+
+
+#### F. NNAR
+```{r}
+if (best_nnar$Model == "NNAR Auto") {
+  best_nnar_pred <- fc_nnar_auto$mean
+} else {
+  best_nnar_spec <- nnar_plot_specs[[
+    which(sapply(nnar_plot_specs, `[[`, "label") == best_nnar$Model)
+  ]]
+  set.seed(123)
+  fit_best_nnar  <- nnetar(train_merah,
+                           p    = best_nnar_spec$p,
+                           P    = best_nnar_spec$P,
+                           size = best_nnar_spec$size)
+  best_nnar_pred <- forecast(fit_best_nnar, h = length(test_merah))$mean
+}
+```
+
+```{r}
+# Susun data gabungan (facet)
+combined_df <- rbind(
+  data.frame(Index = seq_along(test_merah),
+             Actual = as.numeric(test_merah),
+             Predicted = as.numeric(best_naive_pred),
+             Family = paste0("A. Naive\n(", best_naive$Model, ")")),
+  
+  data.frame(Index = seq_along(test_merah),
+             Actual = as.numeric(test_merah),
+             Predicted = as.numeric(best_es_pred),
+             Family = paste0("B. ETS\n(", best_es$Model, ")")),
+  
+  data.frame(Index = seq_along(test_merah),
+             Actual = as.numeric(test_merah),
+             Predicted = as.numeric(best_arima_pred),
+             Family = paste0("C. ARIMA\n(", best_arima$Model, ")")),
+  
+  data.frame(Index = seq_along(test_merah),
+             Actual = as.numeric(test_merah),
+             Predicted = as.numeric(best_sarima_pred),
+             Family = paste0("D. SARIMA\n(", best_sarima$Model, ")")),
+  
+  data.frame(Index = seq_along(test_reg$y),
+             Actual = as.numeric(test_reg$y),
+             Predicted = as.numeric(best_reg_pred),
+             Family = paste0("E. Regression\n(", best_reg$Model, ")")),
+  
+  data.frame(Index = seq_along(test_merah),
+             Actual = as.numeric(test_merah),
+             Predicted = as.numeric(best_nnar_pred),
+             Family = paste0("F. NNAR\n(", best_nnar$Model, ")"))
+)
+
+combined_long <- combined_df %>%
+  pivot_longer(
+    cols      = c(Actual, Predicted),
+    names_to  = "Type",
+    values_to = "Harga"
+  ) %>%
+  mutate(Type = factor(Type, levels = c("Actual", "Predicted")))
+
+ggplot(combined_long, aes(x = Index, y = Harga,
+                          color = Type, linewidth = Type)) +
+  geom_line() +
+  facet_wrap(~ Family, scales = "free_y", ncol = 2) +
+  scale_color_manual(
+    name   = "colour",
+    values = c("Actual"    = "#1a1a1a",
+               "Predicted" = "#2196F3")
+  ) +
+  scale_linewidth_manual(
+    values = c("Actual" = 0.55, "Predicted" = 0.75),
+    guide  = "none"
+  ) +
+  labs(
+    title = "Forecast vs Actual – Best Model per Family",
+    x     = "Week Index",
+    y     = "Harga (Rp)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    strip.text       = element_text(face = "bold", size = 9),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
