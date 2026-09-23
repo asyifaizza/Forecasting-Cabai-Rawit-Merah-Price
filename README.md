@@ -737,11 +737,14 @@ paper.pdf
 # Author
 
 **Asyifa Izzatil Isma**
+**M. Aufa Mumtaza Ibadillah**
 
 Computer Science & Statistics  
 BINUS University
 
-GitHub: [@asyifaizza](https://github.com/asyifaizza)
+GitHub: 
+- [@asyifaizza](https://github.com/asyifaizza)
+- [@mumtazaufaa](https://github.com/mumtazaufaa)
 
 ---
 
