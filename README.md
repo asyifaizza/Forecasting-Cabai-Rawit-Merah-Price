@@ -736,8 +736,8 @@ paper.pdf
 
 # Author
 
-**Asyifa Izzatil Isma**
-**M. Aufa Mumtaza Ibadillah**
+- **Asyifa Izzatil Isma**
+- **M. Aufa Mumtaza Ibadillah**
 
 Computer Science & Statistics  
 BINUS University
